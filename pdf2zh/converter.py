@@ -47,6 +47,38 @@ from pdf2zh.translator import (
 
 log = logging.getLogger(__name__)
 
+import atexit  # text export patch
+import os as _os
+
+_TEXT_OUT = _os.environ.get("PDF2ZH_TEXT_OUT")
+_text_pending: list[str] = []
+_END_PUNCT = tuple(".;:!?»)\"'…")
+
+
+def _text_export(paragraph: str) -> None:
+    """Append one translated paragraph to PDF2ZH_TEXT_OUT (text export patch)."""
+    if not _TEXT_OUT:
+        return
+    p = re.sub(r"\s+", " ", paragraph).strip()
+    if not p or p.isdigit():
+        return
+    if _text_pending and not _text_pending[-1].endswith(_END_PUNCT) and p[0].islower():
+        _text_pending[-1] += " " + p  # paragraph continued from the previous page
+        return
+    _text_pending.append(p)
+    if len(_text_pending) > 1:
+        with open(_TEXT_OUT, "a", encoding="utf-8") as f:
+            f.write(_text_pending.pop(0) + "\n\n")
+
+
+@atexit.register
+def _text_flush() -> None:
+    if _TEXT_OUT and _text_pending:
+        with open(_TEXT_OUT, "a", encoding="utf-8") as f:
+            for p in _text_pending:
+                f.write(p + "\n\n")
+        _text_pending.clear()
+
 
 class PDFConverterEx(PDFConverter):
     def __init__(
@@ -410,126 +442,156 @@ class TranslateConverter(PDFConverterEx):
 
         for id, new in enumerate(news):
             new = add_cjk_latin_spacing(new)
-            x: float = pstk[id].x                       # 段落初始横坐标
-            y: float = pstk[id].y                       # 段落初始纵坐标
-            x0: float = pstk[id].x0                     # 段落左边界
-            x1: float = pstk[id].x1                     # 段落右边界
-            height: float = pstk[id].y1 - pstk[id].y0   # 段落高度
-            size: float = pstk[id].size                 # 段落字体大小
-            brk: bool = pstk[id].brk                    # 段落换行标记
-            cstk: str = ""                              # 当前文字栈
-            fcur: str = None                            # 当前字体 ID
-            lidx = 0                                    # 记录换行次数
-            tx = x
-            fcur_ = fcur
-            ptr = 0
-            log.debug(f"< {y} {x} {x0} {x1} {size} {brk} > {sstk[id]} | {new}")
-
-            ops_vals: list[dict] = []
-
-            while ptr < len(new):
-                vy_regex = re.match(
-                    r"\{\s*v([\d\s]+)\}", new[ptr:], re.IGNORECASE
-                )  # 匹配 {vn} 公式标记
-                mod = 0  # 文字修饰符
-                if vy_regex:  # 加载公式
-                    ptr += len(vy_regex.group(0))
+            def _formula_text(m):  # text export patch
+                try:
+                    return "".join(ch.get_text() for ch in var[int(m.group(1).replace(" ", ""))])
+                except Exception:
+                    return ""
+            if not re.fullmatch(r"\s*(\{\s*v[\d\s]+\}\s*)*", new):
+                _text_export(re.sub(r"\{\s*v([\d\s]+)\}", _formula_text, new))
+            fit_size = pstk[id].size  # shrink font to fit
+            for _fit_try in range(8):
+                x: float = pstk[id].x                       # 段落初始横坐标
+                y: float = pstk[id].y                       # 段落初始纵坐标
+                x0: float = pstk[id].x0                     # 段落左边界
+                x1: float = pstk[id].x1                     # 段落右边界
+                height: float = pstk[id].y1 - pstk[id].y0   # 段落高度
+                size: float = pstk[id].size                 # 段落字体大小
+                size = fit_size
+                brk: bool = pstk[id].brk                    # 段落换行标记
+                cstk: str = ""                              # 当前文字栈
+                fcur: str = None                            # 当前字体 ID
+                lidx = 0                                    # 记录换行次数
+                tx = x
+                fcur_ = fcur
+                ptr = 0
+                log.debug(f"< {y} {x} {x0} {x1} {size} {brk} > {sstk[id]} | {new}")
+                def char_adv(c):  # word wrap patch: width of one character
                     try:
-                        vid = int(vy_regex.group(1).replace(" ", ""))
-                        adv = vlen[vid]
-                    except Exception:
-                        continue  # 翻译器可能会自动补个越界的公式标记
-                    if var[vid][-1].get_text() and unicodedata.category(var[vid][-1].get_text()[0]) in ["Lm", "Mn", "Sk"]:  # 文字修饰符
-                        mod = var[vid][-1].width
-                else:  # 加载文字
-                    ch = new[ptr]
-                    fcur_ = None
-                    try:
-                        if fcur_ is None and self.fontmap["tiro"].to_unichr(ord(ch)) == ch:
-                            fcur_ = "tiro"  # 默认拉丁字体
+                        if self.fontmap["tiro"].to_unichr(ord(c)) == c:
+                            return self.fontmap["tiro"].char_width(ord(c)) * size
                     except Exception:
                         pass
-                    if fcur_ is None:
-                        fcur_ = self.noto_name  # 默认非拉丁字体
-                    if fcur_ == self.noto_name: # FIXME: change to CONST
-                        adv = self.noto.char_lengths(ch, size)[0]
-                    else:
-                        adv = self.fontmap[fcur_].char_width(ord(ch)) * size
-                    ptr += 1
-                if (                                # 输出文字缓冲区
-                    fcur_ != fcur                   # 1. 字体更新
-                    or vy_regex                     # 2. 插入公式
-                    or x + adv > x1 + 0.1 * size    # 3. 到达右边界（可能一整行都被符号化，这里需要考虑浮点误差）
-                ):
-                    if cstk:
-                        ops_vals.append({
-                            "type": OpType.TEXT,
-                            "font": fcur,
-                            "size": size,
-                            "x": tx,
-                            "dy": 0,
-                            "rtxt": raw_string(fcur, cstk),
-                            "lidx": lidx
-                        })
-                        cstk = ""
-                if brk and x + adv > x1 + 0.1 * size:  # 到达右边界且原文段落存在换行
-                    x = x0
-                    lidx += 1
-                if vy_regex:  # 插入公式
-                    fix = 0
-                    if fcur is not None:  # 段落内公式修正纵向偏移
-                        fix = varf[vid]
-                    for vch in var[vid]:  # 排版公式字符
-                        vc = chr(vch.cid)
-                        ops_vals.append({
-                            "type": OpType.TEXT,
-                            "font": self.fontid[vch.font],
-                            "size": vch.size,
-                            "x": x + vch.x0 - var[vid][0].x0,
-                            "dy": fix + vch.y0 - var[vid][0].y0,
-                            "rtxt": raw_string(self.fontid[vch.font], vc),
-                            "lidx": lidx
-                        })
-                        if log.isEnabledFor(logging.DEBUG):
-                            lstk.append(LTLine(0.1, (_x, _y), (x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0)))
-                            _x, _y = x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0
-                    for l in varl[vid]:  # 排版公式线条
-                        if l.linewidth < 5:  # hack 有的文档会用粗线条当图片背景
+                    return self.noto.char_lengths(c, size)[0]
+
+                ops_vals: list[dict] = []
+
+                while ptr < len(new):
+                    vy_regex = re.match(
+                        r"\{\s*v([\d\s]+)\}", new[ptr:], re.IGNORECASE
+                    )  # 匹配 {vn} 公式标记
+                    mod = 0  # 文字修饰符
+                    word_wrap = False
+                    if vy_regex:  # 加载公式
+                        ptr += len(vy_regex.group(0))
+                        try:
+                            vid = int(vy_regex.group(1).replace(" ", ""))
+                            adv = vlen[vid]
+                        except Exception:
+                            continue  # 翻译器可能会自动补个越界的公式标记
+                        if var[vid][-1].get_text() and unicodedata.category(var[vid][-1].get_text()[0]) in ["Lm", "Mn", "Sk"]:  # 文字修饰符
+                            mod = var[vid][-1].width
+                    else:  # 加载文字
+                        ch = new[ptr]
+                        fcur_ = None
+                        try:
+                            if fcur_ is None and self.fontmap["tiro"].to_unichr(ord(ch)) == ch:
+                                fcur_ = "tiro"  # 默认拉丁字体
+                        except Exception:
+                            pass
+                        if fcur_ is None:
+                            fcur_ = self.noto_name  # 默认非拉丁字体
+                        if fcur_ == self.noto_name: # FIXME: change to CONST
+                            adv = self.noto.char_lengths(ch, size)[0]
+                        else:
+                            adv = self.fontmap[fcur_].char_width(ord(ch)) * size
+                        ptr += 1
+                        if ch != " " and (ptr == 1 or new[ptr - 2] == " "):  # word wrap patch
+                            wend, wwidth = ptr - 1, 0.0
+                            while wend < len(new) and new[wend] not in " {":
+                                wwidth += char_adv(new[wend])
+                                wend += 1
+                            if x > x0 + 0.1 * size and x + wwidth > x1 + 0.1 * size and wwidth <= x1 - x0:
+                                word_wrap = True
+                    if (                                # 输出文字缓冲区
+                        fcur_ != fcur                   # 1. 字体更新
+                        or vy_regex                     # 2. 插入公式
+                        or x + adv > x1 + 0.1 * size    # 3. 到达右边界（可能一整行都被符号化，这里需要考虑浮点误差）
+                        or word_wrap  # word wrap patch
+                    ):
+                        if cstk:
                             ops_vals.append({
-                                "type": OpType.LINE,
-                                "x": l.pts[0][0] + x - var[vid][0].x0,
-                                "dy": l.pts[0][1] + fix - var[vid][0].y0,
-                                "linewidth": l.linewidth,
-                                "xlen": l.pts[1][0] - l.pts[0][0],
-                                "ylen": l.pts[1][1] - l.pts[0][1],
+                                "type": OpType.TEXT,
+                                "font": fcur,
+                                "size": size,
+                                "x": tx,
+                                "dy": 0,
+                                "rtxt": raw_string(fcur, cstk),
                                 "lidx": lidx
                             })
-                else:  # 插入文字缓冲区
-                    if not cstk:  # 单行开头
-                        tx = x
-                        if x == x0 and ch == " ":  # 消除段落换行空格
-                            adv = 0
+                            cstk = ""
+                    if brk and (x + adv > x1 + 0.1 * size or word_wrap):  # 到达右边界且原文段落存在换行
+                        x = x0
+                        lidx += 1
+                    if vy_regex:  # 插入公式
+                        fix = 0
+                        if fcur is not None:  # 段落内公式修正纵向偏移
+                            fix = varf[vid]
+                        for vch in var[vid]:  # 排版公式字符
+                            vc = chr(vch.cid)
+                            ops_vals.append({
+                                "type": OpType.TEXT,
+                                "font": self.fontid[vch.font],
+                                "size": vch.size,
+                                "x": x + vch.x0 - var[vid][0].x0,
+                                "dy": fix + vch.y0 - var[vid][0].y0,
+                                "rtxt": raw_string(self.fontid[vch.font], vc),
+                                "lidx": lidx
+                            })
+                            if log.isEnabledFor(logging.DEBUG):
+                                lstk.append(LTLine(0.1, (_x, _y), (x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0)))
+                                _x, _y = x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0
+                        for l in varl[vid]:  # 排版公式线条
+                            if l.linewidth < 5:  # hack 有的文档会用粗线条当图片背景
+                                ops_vals.append({
+                                    "type": OpType.LINE,
+                                    "x": l.pts[0][0] + x - var[vid][0].x0,
+                                    "dy": l.pts[0][1] + fix - var[vid][0].y0,
+                                    "linewidth": l.linewidth,
+                                    "xlen": l.pts[1][0] - l.pts[0][0],
+                                    "ylen": l.pts[1][1] - l.pts[0][1],
+                                    "lidx": lidx
+                                })
+                    else:  # 插入文字缓冲区
+                        if not cstk:  # 单行开头
+                            tx = x
+                            if x == x0 and ch == " ":  # 消除段落换行空格
+                                adv = 0
+                            else:
+                                cstk += ch
                         else:
                             cstk += ch
-                    else:
-                        cstk += ch
-                adv -= mod # 文字修饰符
-                fcur = fcur_
-                x += adv
-                if log.isEnabledFor(logging.DEBUG):
-                    lstk.append(LTLine(0.1, (_x, _y), (x, y)))
-                    _x, _y = x, y
-            # 处理结尾
-            if cstk:
-                ops_vals.append({
-                    "type": OpType.TEXT,
-                    "font": fcur,
-                    "size": size,
-                    "x": tx,
-                    "dy": 0,
-                    "rtxt": raw_string(fcur, cstk),
-                    "lidx": lidx
-                })
+                    adv -= mod # 文字修饰符
+                    fcur = fcur_
+                    x += adv
+                    if log.isEnabledFor(logging.DEBUG):
+                        lstk.append(LTLine(0.1, (_x, _y), (x, y)))
+                        _x, _y = x, y
+                # 处理结尾
+                if cstk:
+                    ops_vals.append({
+                        "type": OpType.TEXT,
+                        "font": fcur,
+                        "size": size,
+                        "x": tx,
+                        "dy": 0,
+                        "rtxt": raw_string(fcur, cstk),
+                        "lidx": lidx
+                    })
+
+                if not brk or lidx == 0 or (lidx + 1) * size <= height * 1.02:
+                    break
+                fit_size = size * 0.95
 
             line_height = default_line_height
 
