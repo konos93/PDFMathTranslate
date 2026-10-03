@@ -1,3 +1,13 @@
+###  Personal notes for PDF to ePub translation from English to Greek.
+
+(pdf2zh-env) PS C:\Users\konos\translator> cat .\readme
+PS C:\Users\konos\translator> .\pdf2zh-env\Scripts\Activate.ps1
+
+(pdf2zh-env) PS C:\Users\konos\translator> pdf2zh ".\test\p16-17.pdf" -li en -lo el -s ollama:gemma3:12b -o .\test-final --prompt .\prompt_el.txt
+(pdf2zh-env) PS C:\Users\konos\translator> ebook-convert ".\test-final\p16-17.txt" ".\output\book-el.epub" --formatting-type plain --paragraph-type block --language el --title "Τίτλος βιβλίου" --authors "Συγγραφέας"
+
+
+
 <div align="center">
 	<a href="https://go.warp.dev/PDFMathTranslate" target="_blank">
 		<sup>Special thanks to:</sup>
